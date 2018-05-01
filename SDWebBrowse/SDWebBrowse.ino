@@ -1,140 +1,137 @@
 /*
  * SDWebBrowse.ino
  *
- * This sketch uses the microSD card slot on the a W5500 Ethernet shield
+ * This sketch uses the microSD card slot on the a WIZ5500 Ethernet shield
  * to serve up files over a very minimal browsing interface
  *
  * Some code is from Bill Greiman's SdFatLib examples, some is from the
  * Arduino Ethernet WebServer example and the rest is from Limor Fried
  * (Adafruit) so its probably under GPL
  *
- * Tutorial is at https://learn.adafruit.com/
+ * Tutorial is at https://learn.adafruit.com/arduino-ethernet-sd-card/serving-files-over-ethernet
+ * 
+ * Please use the Adafruit Ethernet2 library https://github.com/adafruit/Ethernet2
  */
-
-#include <SD.h>
-#include <Ethernet2.h>
+ 
 #include <SPI.h>
+#include <SD.h>
+#include <Ethernet2.h>  // Using WIZ5500 Ethernet chip so Adafruit Ethernet2 library is required
 
 /************ ETHERNET STUFF ************/
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-byte ip[] = { 192, 168, 1, 177 };
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };  // change if necessary
+byte ip[] = { 192, 168, 1, 177 };                     // change if necessary
 EthernetServer server(80);
-const int W5500_SS = 10; // Adafruit/Seeed Studio shield + Uno, 53 for Mega
+
 /************ SDCARD STUFF ************/
-Sd2Card card;
-SdVolume volume;
-SdFile root;
-SdFile file;
+#define SDCARD_CS 4
+File root;
+
+#if defined(ESP8266)
+  // default for ESPressif
+  #define WIZ_CS 15
+#elif defined(ESP32)
+  #define WIZ_CS 33
+#elif defined(ARDUINO_STM32_FEATHER)
+  // default for WICED
+  #define WIZ_CS PB4
+#elif defined(TEENSYDUINO)
+  #define WIZ_CS 10
+#elif defined(ARDUINO_FEATHER52)
+  #define WIZ_CS 11
+#else   // default for 328p, 32u4 and m0
+  #define WIZ_CS 10
+#endif
 
 // store error strings in flash to save RAM
 #define error(s) error_P(PSTR(s))
 
 void error_P(const char* str) {
-  PgmPrint("error: ");
-  SerialPrintln_P(str);
-  if (card.errorCode()) {
-    PgmPrint("SD error: ");
-    Serial.print(card.errorCode(), HEX);
-    Serial.print(',');
-    Serial.println(card.errorData(), HEX);
-  }
+  Serial.print(F("error: "));
+  Serial.println(str);
+
   while(1);
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
+  while (!Serial);      // For 32u4 based microcontrollers like 32u4 Adalogger Feather
  
-  PgmPrint("Free RAM: ");
-  Serial.println(FreeRam());  
-  
-  // initialize the SD card at SPI_HALF_SPEED to avoid bus errors with
-  // breadboards.  use SPI_FULL_SPEED for better performance.
-  pinMode(W5500_SS, OUTPUT);     // set the SS pin as an output (necessary!)
-  digitalWrite(W5500_SS, HIGH);  // but turn off the W5100 chip!
+  //Serial.print(F("Free RAM: ")); Serial.println(FreeRam());  
 
-  if (!card.init(SPI_HALF_SPEED, 4)) error("card.init failed!");
+  if (!SD.begin(SDCARD_CS)) {
+    error("card.init failed!");
+  } 
   
-  // initialize a FAT volume
-  if (!volume.init(&card)) error("vol.init failed!");
-
-  PgmPrint("Volume is FAT");
-  Serial.println(volume.fatType(),DEC);
-  Serial.println();
-  
-  if (!root.openRoot(&volume)) error("openRoot failed");
-
-  // list file in root with date and size
-  PgmPrintln("Files found in root:");
-  root.ls(LS_DATE | LS_SIZE);
-  Serial.println();
+  root = SD.open("/");
+  printDirectory(root, 0);
   
   // Recursive list of all directories
-  PgmPrintln("Files found in all dirs:");
-  root.ls(LS_R);
+  Serial.println(F("Files found in all dirs:"));
+  printDirectory(root, 0);
   
   Serial.println();
-  PgmPrintln("Done");
+  Serial.println(F("Done"));
   
   // Debugging complete, we start the server!
+  Serial.println(F("Initializing WizNet"));
+  Ethernet.init(WIZ_CS);
+  // give the ethernet module time to boot up
+  delay(1000);
+  // start the Ethernet connection
+  // Use the fixed IP specified. If you want to use DHCP first
+  //   then switch the Ethernet.begin statements
   Ethernet.begin(mac, ip);
+  // try to congifure using DHCP address instead of IP:
+  //  Ethernet.begin(mac);
+  
+  // print the Ethernet board/shield's IP address to Serial monitor
+  Serial.print(F("My IP address: "));
+  Serial.println(Ethernet.localIP());
+
   server.begin();
 }
 
-void ListFiles(EthernetClient client, uint8_t flags) {
-  // This code is just copied from SdFile.cpp in the SDFat library
-  // and tweaked to print to the client output in html!
-  dir_t p;
-  
-  root.rewind();
+void ListFiles(EthernetClient client, uint8_t flags, File dir) {
   client.println("<ul>");
-  while (root.readDir(p) > 0) {
+  while (true) {
+    File entry = dir.openNextFile();
+   
     // done if past last used entry
-    if (p.name[0] == DIR_NAME_FREE) break;
-
-    // skip deleted entry and entries for . and  ..
-    if (p.name[0] == DIR_NAME_DELETED || p.name[0] == '.') continue;
-
-    // only list subdirectories and files
-    if (!DIR_IS_FILE_OR_SUBDIR(&p)) continue;
+     if (! entry) {
+       // no more files
+       break;
+     }
 
     // print any indent spaces
     client.print("<li><a href=\"");
-    for (uint8_t i = 0; i < 11; i++) {
-      if (p.name[i] == ' ') continue;
-      if (i == 8) {
-        client.print('.');
-      }
-      client.print((char)p.name[i]);
+    client.print(entry.name());
+    if (entry.isDirectory()) {
+       client.println("/");
     }
     client.print("\">");
     
     // print file name with possible blank fill
-    for (uint8_t i = 0; i < 11; i++) {
-      if (p.name[i] == ' ') continue;
-      if (i == 8) {
-        client.print('.');
-      }
-      client.print((char)p.name[i]);
+    client.print(entry.name());
+    if (entry.isDirectory()) {
+       client.println("/");
     }
-    
+        
     client.print("</a>");
-    
-    if (DIR_IS_SUBDIR(&p)) {
-      client.print('/');
-    }
-
+/*
     // print modify date/time if requested
     if (flags & LS_DATE) {
-       root.printFatDate(p.lastWriteDate);
+       dir.printFatDate(p.lastWriteDate);
        client.print(' ');
-       root.printFatTime(p.lastWriteTime);
+       dir.printFatTime(p.lastWriteTime);
     }
     // print size if requested
     if (!DIR_IS_SUBDIR(&p) && (flags & LS_SIZE)) {
       client.print(' ');
       client.print(p.fileSize);
     }
+    */
     client.println("</li>");
+    entry.close();
   }
   client.println("</ul>");
 }
@@ -145,6 +142,7 @@ void ListFiles(EthernetClient client, uint8_t flags) {
 void loop()
 {
   char clientline[BUFSIZ];
+  char name[17];
   int index = 0;
   
   EthernetClient client = server.available();
@@ -177,49 +175,62 @@ void loop()
         // Print it out for debugging
         Serial.println(clientline);
         
-        // Look for substring such as a request to get the root file
-        if (strstr(clientline, "GET / ") != 0) {
-          // send a standard http response header
-          client.println("HTTP/1.1 200 OK");
-          client.println("Content-Type: text/html");
-          client.println();
-          
-          // print all the files, use a helper to keep it clean
-          client.println("<h2>Files:</h2>");
-          ListFiles(client, LS_SIZE);
-        } else if (strstr(clientline, "GET /") != 0) {
+        // Look for substring such as a request to get the file
+        if (strstr(clientline, "GET /") != 0) {
           // this time no space after the /, so a sub-file!
           char *filename;
           
-          filename = clientline + 5; // look after the "GET /" (5 chars)
+          filename = clientline + 5; // look after the "GET /" (5 chars)  *******
           // a little trick, look for the " HTTP/1.1" string and 
           // turn the first character of the substring into a 0 to clear it out.
           (strstr(clientline, " HTTP"))[0] = 0;
+ 
+          if(filename[strlen(filename)-1] == '/') {  // Trim a directory filename
+            filename[strlen(filename)-1] = 0;        //  as Open throws error with trailing /
+          }
           
-          // print the file we want
-          Serial.println(filename);
+          Serial.print(F("Web request for: ")); Serial.println(filename);  // print the file we want
 
-          if (! file.open(&root, filename, O_READ)) {
+          File file = SD.open(filename, O_READ);
+          if ( file == 0 ) {  // Opening the file with return code of 0 is an error in SDFile.open
             client.println("HTTP/1.1 404 Not Found");
             client.println("Content-Type: text/html");
             client.println();
             client.println("<h2>File Not Found!</h2>");
-            break;
+            client.println("<br><h3>Couldn't open the File!</h3>");
+            break; 
           }
           
-          Serial.println("Opened!");
+          Serial.println("File Opened!");
                     
           client.println("HTTP/1.1 200 OK");
-          client.println("Content-Type: text/plain");
-          client.println();
+          if (file.isDirectory()) {
+            Serial.println("is a directory");
+            //file.close();
+            client.println("Content-Type: text/html");
+            client.println();
+            client.print("<h2>Files in /");
+            client.print(filename); 
+            client.println(":</h2>");
+            ListFiles(client,LS_SIZE,file);  
+            file.close();                   
+          } else { // Any non-directory clicked, server will send file to client for download
+            client.println("Content-Type: application/octet-stream");
+            client.println();
           
-          int16_t c;
-          while ((c = file.read()) > 0) {
+            char file_buffer[16];
+            int avail;
+            while (avail = file.available()) {
+              int to_read = min(avail, 16);
+              if (to_read != file.read(file_buffer, to_read)) {
+                break;
+              }
               // uncomment the serial to debug (slow!)
-              //Serial.print((char)c);
-              client.print((char)c);
+              //Serial.write((char)c);
+              client.write(file_buffer, to_read);
+            }
+            file.close();
           }
-          file.close();
         } else {
           // everything else is a 404
           client.println("HTTP/1.1 404 Not Found");
@@ -235,3 +246,28 @@ void loop()
     client.stop();
   }
 }
+
+
+void printDirectory(File dir, int numTabs) {
+   while(true) {
+     File entry =  dir.openNextFile();
+     if (! entry) {
+       // no more files
+       break;
+     }
+     for (uint8_t i=0; i<numTabs; i++) {
+       Serial.print('\t');
+     }
+     Serial.print(entry.name());
+     if (entry.isDirectory()) {
+       Serial.println("/");
+       printDirectory(entry, numTabs+1);
+     } else {
+       // files have sizes, directories do not
+       Serial.print("\t\t");
+       Serial.println(entry.size(), DEC);
+     }
+     entry.close();
+   }
+}
+
